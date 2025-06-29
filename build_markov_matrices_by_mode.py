@@ -1,89 +1,95 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-build_markov_matrices_by_mode.py  (2025-06-30 semi-Markov ready)
----------------------------------------------------------------
-EMOPIA+ functional/lead_sheet を走査して
-  Quadrant(Q1–Q4) × Mode(major/minor)
-の **自己遷移を除いた** 1 次 Markov 行列 (CSV) を出力する。
+build_markov_matrices_by_mode.py   (2025-06-30  first-chord 対応)
+----------------------------------------------------------------
+* Quadrant×Mode の自己遷移除外 Markov 行列 (CSV)
+* Quadrant×Mode の曲頭ヒストグラム first_chord_probs.json
+を生成する。
 
 python build_markov_matrices_by_mode.py -i ./EMOPIA+/functional/lead_sheet -o markov_matrices_mode
+
 """
 
 from __future__ import annotations
-import argparse, logging, pickle
+import argparse, json, logging, pickle
 from collections import defaultdict, Counter
 from pathlib import Path
+from typing import Dict, Tuple, List
 
 import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# --------------------------------------------------
-# ユーティリティ
-# --------------------------------------------------
-def extract_chords(events):
-    """Chord イベントの value を順番に取り出す"""
+# ---------------------------------------------------------------------------
+def extract_chords(events: List[dict]) -> List[str]:
     return [ev["value"] for ev in events if ev.get("name") == "Chord"]
 
-# --------------------------------------------------
-def build_matrices(input_dir: Path, output_dir: Path):
-    # {Q → {mode → Counter[(prev,next)]}}
-    counts = defaultdict(lambda: defaultdict(Counter))
+# ---------------------------------------------------------------------------
+def build(input_dir: Path, out_dir: Path):
+    # counts[q][mode][(prev, next)] = n
+    counts: Dict[str, Dict[str, Counter[Tuple[str, str]]]] = \
+        defaultdict(lambda: defaultdict(Counter))
+    # first[q][mode][code] = n
+    first: Dict[str, Dict[str, Counter[str]]] = \
+        defaultdict(lambda: defaultdict(Counter))
     all_codes = set()
 
-    for pkl_path in input_dir.glob("*.pkl"):
+    for pkl in input_dir.glob("*.pkl"):
         try:
-            with open(pkl_path, "rb") as f:
-                _, events = pickle.load(f)
+            _, events = pickle.load(pkl.open("rb"))
         except Exception as e:
-            logger.warning("%s: %s", pkl_path.name, e)
+            log.warning("%s: %s", pkl.name, e)
             continue
 
-        key_token = next((ev["value"] for ev in events
-                          if ev.get("name") == "Key"), "C")
-        mode = "major" if key_token.isupper() else "minor"
-        quadrant = pkl_path.name.split("_")[0]  # 'Q1' など
+        quadrant = pkl.name.split("_")[0]           # Q1 etc.
+        mode     = "major" if any(ev.get("value", "").isupper()
+                                  for ev in events if ev.get("name") == "Key") \
+                     else "minor"
 
         chords = extract_chords(events)
         if len(chords) < 2:
             continue
+
+        first[quadrant][mode][chords[0]] += 1
         all_codes.update(chords)
 
-        # -------- 自己遷移を無視してカウント ----------
         for prev, nxt in zip(chords[:-1], chords[1:]):
-            if prev != nxt:
+            if prev != nxt:                         # ★自己遷移は除外
                 counts[quadrant][mode][(prev, nxt)] += 1
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # ---------- 出力 ----------
+    out_dir.mkdir(parents=True, exist_ok=True)
     codes_sorted = sorted(all_codes)
 
-    for quadrant, mdict in counts.items():
-        for mode, ctr in mdict.items():
-            df = pd.DataFrame(
-                0, index=codes_sorted, columns=codes_sorted, dtype=int
-            )
-            for (prev, nxt), c in ctr.items():
-                df.at[prev, nxt] = c
-
+    for q, mode_dict in counts.items():
+        for m, ctr in mode_dict.items():
+            df = pd.DataFrame(0, index=codes_sorted, columns=codes_sorted, dtype=int)
+            for (i, j), n in ctr.items():
+                df.at[i, j] = n
             prob = df.div(df.sum(axis=1).replace(0, 1), axis=0)
-            out = output_dir / f"{quadrant}_{mode}.csv"
-            prob.to_csv(out, encoding="utf-8-sig")
-            logger.info("saved %s", out.name)
+            csv = out_dir / f"{q}_{m}.csv"
+            prob.to_csv(csv, encoding="utf-8-sig")
+            log.info("matrix saved: %s", csv.name)
 
-# --------------------------------------------------
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-i", "--input", required=True,
-                    help="lead_sheet *.pkl フォルダ")
-    ap.add_argument("-o", "--output", required=True,
-                    help="CSV 出力フォルダ")
-    return ap.parse_args()
+    # ---------- first-chord JSON ----------
+    json_obj = {}
+    for q, mode_dict in first.items():
+        for m, ctr in mode_dict.items():
+            tot = sum(ctr.values())
+            json_obj[f"{q}_{m}"] = {c: v / tot for c, v in ctr.items()}
+    (out_dir / "first_chord_probs.json").write_text(
+        json.dumps(json_obj, ensure_ascii=False, indent=2), "utf-8")
+    log.info("first_chord_probs.json saved.")
 
+# ---------------------------------------------------------------------------
 def main():
-    a = parse_args()
-    build_matrices(Path(a.input), Path(a.output))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-i", "--input", required=True,  help="lead_sheet *.pkl directory")
+    ap.add_argument("-o", "--output", required=True, help="output directory")
+    a = ap.parse_args()
+    build(Path(a.input).expanduser(), Path(a.output).expanduser())
 
 if __name__ == "__main__":
     main()
