@@ -1,42 +1,53 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-generator.py  (first-chord + semi-Markov 2025-06-30)
----------------------------------------------------
-Quadrant 指定 → 曲頭コードを専用分布で抽選 → セミマルコフ生成 → MIDI 保存
+generator.py  (2025-07-01 invalid-code safe)
+-------------------------------------------
+* first-chord ヒスト／セミマルコフ生成
+* 無効コード(None_None 等) を完全スキップ
 """
 
 from __future__ import annotations
 import argparse, json, sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Dict, Optional
 
 import numpy as np
 import pandas as pd
 import mido
 from mido import MidiFile, MidiTrack, Message, bpm2tempo
-from voicings import get_voicing
+from voicings import get_voicing, parse_symbol   # parse_symbol で簡易バリデーション
 
 MATRIX_DIR  = Path("markov_matrices_mode")
 STAY_JSON   = Path("stay_histograms.json")
-FIRST_JSON  = MATRIX_DIR / "first_chord_probs.json"  # ←build スクリプトと同じ場所
-PPQ         = 480
-TEMPO_BPM   = 120
+FIRST_JSON  = MATRIX_DIR / "first_chord_probs.json"
+PPQ, TEMPO_BPM = 480, 120
 
-# ------------- サポート関数 ------------------------------------
-def load_json(path: Path) -> dict:
-    return json.loads(path.read_text("utf-8")) if path.exists() else {}
+INVALID = {"None_None", None, ""}
+
+# ---------------- utility --------------------------------------------------
+def load_json(p: Path) -> dict:
+    return json.loads(p.read_text("utf-8")) if p.exists() else {}
 
 STAY_HIST  = load_json(STAY_JSON)
 FIRST_PROB = load_json(FIRST_JSON)
 
-def sample_stay(chord: str, rng: np.random.Generator, max_stay: int) -> int:
-    tbl = STAY_HIST.get(chord)
+def is_valid(ch: str) -> bool:
+    if ch in INVALID:
+        return False
+    try:
+        parse_symbol(ch)
+        return True
+    except Exception:
+        return False
+
+def sample_stay(ch: str, rng: np.random.Generator, max_stay: int) -> int:
+    tbl = STAY_HIST.get(ch)
     if not tbl:
         return 1
-    k  = np.fromiter(tbl.keys(), dtype=int)
-    p  = np.fromiter(tbl.values(), dtype=float)
-    τ  = int(rng.choice(k, p=p))
+    k = np.fromiter(tbl.keys(), int)
+    p = np.fromiter(tbl.values(), float)
+    τ = int(rng.choice(k, p=p))
     return max(1, min(τ, max_stay))
 
 def load_matrix(q: str, mode: str) -> pd.DataFrame:
@@ -45,51 +56,30 @@ def load_matrix(q: str, mode: str) -> pd.DataFrame:
         sys.exit(f"[Error] matrix not found: {f}")
     return pd.read_csv(f, index_col=0)
 
-def choose_mode(q: str) -> str:
-    # 曲数の多い方を選ぶ
-    major_csv = MATRIX_DIR / f"{q}_major.csv"
-    minor_csv = MATRIX_DIR / f"{q}_minor.csv"
-    return "major" if major_csv.exists() else "minor"
-
-# ---------------------------------------------------------------
-def choose_first(
-    codes: List[str],
-    quadrant: str,
-    mode: str,
-    rng: np.random.Generator,
-    forced: Optional[str] = None,
-) -> str:
-    if forced:
+def choose_first(codes: List[str], q: str, mode: str,
+                 rng: np.random.Generator,
+                 forced: Optional[str] = None) -> str:
+    if forced and is_valid(forced):
         return forced
-    key = f"{quadrant}_{mode}"
-    tbl = FIRST_PROB.get(key)
-    if tbl:
-        p = np.array([tbl.get(c, 0.0) for c in codes])
-        if p.sum() > 0:
-            p /= p.sum()
-            return rng.choice(codes, p=p)
-    # fallback: 行和重み
-    p = np.ones(len(codes))
-    p /= p.sum()
-    return rng.choice(codes, p=p)
-
-# ---------------------------------------------------------------
-def _apply_temp(p: np.ndarray, T: float) -> np.ndarray:
+    key = f"{q}_{mode}"
+    tbl = FIRST_PROB.get(key, {})
+    p = np.array([tbl.get(c, 0.0) for c in codes])
     if p.sum() == 0:
-        return p
-    q = p ** (1.0 / T)
-    return q / q.sum()
+        p = np.ones(len(codes))
+    p /= p.sum()
+    while True:
+        ch = rng.choice(codes, p=p)
+        if is_valid(ch):
+            return ch
 
-def generate(
-    matrix: pd.DataFrame,
-    bars: int,
-    rng: np.random.Generator,
-    start_code: str,
-    max_stay: int,
-    T: float,
-) -> List[str]:
-    codes = matrix.index.to_list()
-    cur   = start_code
+def apply_temp(v: np.ndarray, T: float):
+    return (v ** (1 / T)) / v.sum() if v.sum() else v
+
+# ---------------- core -----------------------------------------------------
+def generate(mat: pd.DataFrame, bars: int, rng: np.random.Generator,
+             start: str, max_stay: int, T: float) -> List[str]:
+    codes = mat.index.to_list()
+    cur   = start
     remain = sample_stay(cur, rng, max_stay)
     prog: List[str] = []
 
@@ -99,60 +89,60 @@ def generate(
         if len(prog) >= bars:
             break
         if remain == 0:
-            row = matrix.loc[cur].to_numpy(float)
-            idx = matrix.columns.get_loc(cur)
-            row[idx] = 0.0                           # 自己遷移禁止
-            row = _apply_temp(row, T)
+            row = mat.loc[cur].to_numpy(float)
+            idx = mat.columns.get_loc(cur)
+            row[idx] = 0.0       # 自己遷移禁止
+            row = apply_temp(row, T)
             if row.sum() == 0:
-                nxt = rng.choice(codes)
+                nxt = rng.choice([c for c in codes if is_valid(c)])
             else:
                 row /= row.sum()
                 nxt = rng.choice(codes, p=row)
-            cur    = nxt
-            remain = sample_stay(cur, rng, max_stay)
+                while not is_valid(nxt):
+                    nxt = rng.choice(codes, p=row)
+            cur, remain = nxt, sample_stay(nxt, rng, max_stay)
     return prog[:bars]
 
-# ---------------------------------------------------------------
+# ---------------- MIDI -----------------------------------------------------
 def chords_to_midi(seq: List[str], out_path: Path, velocity=80):
     midi = MidiFile(ticks_per_beat=PPQ)
-    track = MidiTrack(); midi.tracks.append(track)
-    track.append(mido.MetaMessage("set_tempo", tempo=bpm2tempo(TEMPO_BPM)))
-
+    tr = MidiTrack(); midi.tracks.append(tr)
+    tr.append(mido.MetaMessage("set_tempo", tempo=bpm2tempo(TEMPO_BPM)))
     bar_ticks = PPQ * 4
+
     for ch in seq:
+        if not is_valid(ch):                   # 休符としてスキップ
+            tr.append(Message("note_off", note=0, velocity=0, time=bar_ticks))
+            continue
         notes = get_voicing(ch)
         for n in notes:
-            track.append(Message("note_on", note=n, velocity=velocity, time=0))
-        track.append(Message("note_off", note=notes[0], velocity=0, time=bar_ticks))
+            tr.append(Message("note_on", note=n, velocity=velocity, time=0))
+        tr.append(Message("note_off", note=notes[0], velocity=0, time=bar_ticks))
         for n in notes[1:]:
-            track.append(Message("note_off", note=n, velocity=0, time=0))
+            tr.append(Message("note_off", note=n, velocity=0, time=0))
     midi.save(out_path)
     print(f"[Info] MIDI saved → {out_path.resolve()}")
 
-# ---------------------------------------------------------------
+# ---------------- CLI ------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quadrant", required=True, choices=["Q1", "Q2", "Q3", "Q4"])
     ap.add_argument("--bars", type=int, default=16)
     ap.add_argument("--max-stay", type=int, default=4)
     ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--start-chord", help="固定で曲頭コードを指定")
+    ap.add_argument("--start-chord")
     ap.add_argument("--seed", type=int)
     ap.add_argument("--midi", default="out.mid")
-    args = ap.parse_args()
+    a = ap.parse_args()
 
-    rng   = np.random.default_rng(args.seed)
-    mode  = choose_mode(args.quadrant)
-    mat   = load_matrix(args.quadrant, mode)
-
-    start = choose_first(mat.index.to_list(),
-                         args.quadrant, mode, rng,
-                         forced=args.start_chord)
-    prog = generate(mat, args.bars, rng, start,
-                    max_stay=args.max_stay, T=args.temperature)
+    rng  = np.random.default_rng(a.seed)
+    mode = "major" if (MATRIX_DIR / f"{a.quadrant}_major.csv").exists() else "minor"
+    mat  = load_matrix(a.quadrant, mode)
+    start = choose_first(mat.index.to_list(), a.quadrant, mode, rng, a.start_chord)
+    prog  = generate(mat, a.bars, rng, start, a.max_stay, a.temperature)
 
     print(" | ".join(prog))
-    chords_to_midi(prog, Path(args.midi))
+    chords_to_midi(prog, Path(a.midi))
 
 if __name__ == "__main__":
     main()

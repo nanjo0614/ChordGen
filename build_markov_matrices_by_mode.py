@@ -1,14 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-build_markov_matrices_by_mode.py   (2025-06-30  first-chord 対応)
-----------------------------------------------------------------
+build_markov_matrices_by_mode.py   (2025-07-01 invalid-code filter)
+------------------------------------------------------------------
 * Quadrant×Mode の自己遷移除外 Markov 行列 (CSV)
-* Quadrant×Mode の曲頭ヒストグラム first_chord_probs.json
-を生成する。
-
-python build_markov_matrices_by_mode.py -i ./EMOPIA+/functional/lead_sheet -o markov_matrices_mode
-
+* Quadrant×Mode の曲頭ヒスト first_chord_probs.json
 """
 
 from __future__ import annotations
@@ -22,17 +18,21 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
 log = logging.getLogger(__name__)
 
+INVALID = {"None_None", None, ""}        # ← 追加
+
 # ---------------------------------------------------------------------------
 def extract_chords(events: List[dict]) -> List[str]:
-    return [ev["value"] for ev in events if ev.get("name") == "Chord"]
+    """Chord イベントの value を抽出（無効コードは除外）"""
+    return [
+        ev["value"] for ev in events
+        if ev.get("name") == "Chord" and ev.get("value") not in INVALID
+    ]
 
 # ---------------------------------------------------------------------------
 def build(input_dir: Path, out_dir: Path):
-    # counts[q][mode][(prev, next)] = n
     counts: Dict[str, Dict[str, Counter[Tuple[str, str]]]] = \
         defaultdict(lambda: defaultdict(Counter))
-    # first[q][mode][code] = n
-    first: Dict[str, Dict[str, Counter[str]]] = \
+    first : Dict[str, Dict[str, Counter[str]]] = \
         defaultdict(lambda: defaultdict(Counter))
     all_codes = set()
 
@@ -43,7 +43,7 @@ def build(input_dir: Path, out_dir: Path):
             log.warning("%s: %s", pkl.name, e)
             continue
 
-        quadrant = pkl.name.split("_")[0]           # Q1 etc.
+        quadrant = pkl.name.split("_")[0]           # 'Q1' 等
         mode     = "major" if any(ev.get("value", "").isupper()
                                   for ev in events if ev.get("name") == "Key") \
                      else "minor"
@@ -59,7 +59,6 @@ def build(input_dir: Path, out_dir: Path):
             if prev != nxt:                         # ★自己遷移は除外
                 counts[quadrant][mode][(prev, nxt)] += 1
 
-    # ---------- 出力 ----------
     out_dir.mkdir(parents=True, exist_ok=True)
     codes_sorted = sorted(all_codes)
 
@@ -73,7 +72,6 @@ def build(input_dir: Path, out_dir: Path):
             prob.to_csv(csv, encoding="utf-8-sig")
             log.info("matrix saved: %s", csv.name)
 
-    # ---------- first-chord JSON ----------
     json_obj = {}
     for q, mode_dict in first.items():
         for m, ctr in mode_dict.items():
@@ -86,8 +84,8 @@ def build(input_dir: Path, out_dir: Path):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-i", "--input", required=True,  help="lead_sheet *.pkl directory")
-    ap.add_argument("-o", "--output", required=True, help="output directory")
+    ap.add_argument("-i", "--input", required=True)
+    ap.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     build(Path(a.input).expanduser(), Path(a.output).expanduser())
 
